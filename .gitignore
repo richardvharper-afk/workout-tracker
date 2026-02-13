@@ -1,0 +1,12 @@
+google_credentials.json
+zscaler.pem.cer
+secrets.toml
+.env
+.vs/
+env/
+__pycache__/
+*.pyc
+*.xlsx
+My_Workout_Tracker_local.py
+My_Workout_Tracker_local - Copy.py
+*.pyproj.user
