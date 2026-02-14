@@ -294,6 +294,64 @@ def save_data(updates: list):
                 break  # Found and updated the row, move to next update
 
 
+# --- Find Next Workout ---
+def find_next_workout(df):
+    """Find the next workout to do based on completed data.
+    Returns (default_week, default_day) tuple.
+    """
+    # Get all unique weeks and days, sorted
+    all_weeks = sorted(df['Week'].unique())
+    
+    # Build ordered list of all (week, day) combinations
+    all_workouts = []
+    for week in all_weeks:
+        week_df = df[df['Week'] == week]
+        days = sort_mixed_column(week_df['Day'])
+        for day in days:
+            all_workouts.append((week, day))
+    
+    if not all_workouts:
+        return (1, "1")  # Fallback
+    
+    # Find the last completed workout
+    df['IsDone'] = df[COL_DONE].apply(parse_done)
+    done_df = df[df['IsDone'] == True]
+    
+    if done_df.empty:
+        # No workouts done yet, return first workout
+        return all_workouts[0]
+    
+    # Find the highest week with completed exercises
+    last_done_week = done_df['Week'].max()
+    last_week_done_df = done_df[done_df['Week'] == last_done_week]
+    
+    # Find the highest day in that week with completed exercises
+    last_done_days = last_week_done_df['Day'].unique()
+    # Sort days and get the last one
+    sorted_days = sort_mixed_column(pd.Series(last_done_days))
+    last_done_day = sorted_days[-1] if sorted_days else "1"
+    
+    # Find index of last completed workout
+    last_done_tuple = (last_done_week, str(last_done_day))
+    
+    try:
+        # Find position in ordered list
+        last_idx = None
+        for i, (w, d) in enumerate(all_workouts):
+            if w == last_done_week and str(d) == str(last_done_day):
+                last_idx = i
+                break
+        
+        if last_idx is not None and last_idx < len(all_workouts) - 1:
+            # Return next workout
+            return all_workouts[last_idx + 1]
+        else:
+            # Already at the end, return the last workout (current)
+            return last_done_tuple
+    except (ValueError, IndexError):
+        return all_workouts[0]
+
+
 # --- Main App ---
 st.title("💪 Workout Tracker 2026")
 
@@ -325,15 +383,45 @@ try:
         if 'last_week_day' not in st.session_state:
             st.session_state.last_week_day = None
         
-        # --- Week and Day Selection ---
+        # --- Week and Day Selection with Smart Defaults ---
+        # Find the next workout to do
+        default_week, default_day = find_next_workout(df)
+        
         col1, col2 = st.columns(2)
         with col1:
             weeks = sort_mixed_column(df['Week'])
-            selected_week = st.selectbox("📅 Select Week", weeks, key="week_select")
+            # Find index of default week
+            try:
+                default_week_idx = list(weeks).index(default_week)
+            except ValueError:
+                default_week_idx = 0
+            
+            selected_week = st.selectbox(
+                "📅 Select Week", 
+                weeks, 
+                index=default_week_idx,
+                key="week_select"
+            )
+        
         with col2:
             filtered_df = df[df['Week'].astype(str) == str(selected_week)]
             days = sort_mixed_column(filtered_df['Day'])
-            selected_day = st.selectbox("📆 Select Day", days, key="day_select")
+            
+            # Find index of default day (only if we're on the default week)
+            if selected_week == default_week:
+                try:
+                    default_day_idx = [str(d) for d in days].index(str(default_day))
+                except ValueError:
+                    default_day_idx = 0
+            else:
+                default_day_idx = 0
+            
+            selected_day = st.selectbox(
+                "📆 Select Day", 
+                days, 
+                index=default_day_idx,
+                key="day_select"
+            )
         
         # Reset exercise index when week/day changes
         current_week_day = f"{selected_week}_{selected_day}"
@@ -397,11 +485,37 @@ try:
             exercise_key = get_exercise_key(selected_week, selected_day, section, row['Exercise'])
             
             # Initialize inputs for this exercise if not exists
+            # Pre-populate with existing values from Google Sheets
             if exercise_key not in st.session_state.exercise_inputs:
+                # Load existing Set values from the row
+                existing_sets = {}
+                for i in range(1, 6):
+                    set_col = f'Set{i}'
+                    if set_col in row.index:
+                        set_val = parse_set_value(row.get(set_col))
+                        existing_sets[f'set_{i}'] = set_val
+                
+                # Load existing Load/Variation
+                existing_load_var = ''
+                if COL_LOAD_VAR in row.index:
+                    load_val = row.get(COL_LOAD_VAR)
+                    if pd.notna(load_val) and str(load_val).strip() not in ['', 'nan', 'None']:
+                        existing_load_var = str(load_val)
+                
+                # Load existing Avg RIR
+                existing_avg_rir = 0
+                if COL_AVG_RIR in row.index:
+                    rir_val = row.get(COL_AVG_RIR)
+                    if pd.notna(rir_val):
+                        try:
+                            existing_avg_rir = int(float(rir_val))
+                        except (ValueError, TypeError):
+                            existing_avg_rir = 0
+                
                 st.session_state.exercise_inputs[exercise_key] = {
-                    'sets': {},
-                    'load_variation': '',
-                    'avg_rir': 0
+                    'sets': existing_sets,
+                    'load_variation': existing_load_var,
+                    'avg_rir': existing_avg_rir
                 }
             
             # Section Header
@@ -458,18 +572,35 @@ try:
             if pd.notna(row.get('Notes')) and str(row['Notes']).strip():
                 st.caption(f"📝 {row['Notes']}")
             
-            # Determine number of sets
-            try:
-                base_sets = int(float(str(row['Sets']).strip()))
-            except (ValueError, TypeError):
-                base_sets = 1
+            # Determine number of sets (handle ranges like "3" or "3-4")
+            def parse_sets_for_count(val):
+                """Parse sets value to get a count for input fields."""
+                val_str = str(val).strip()
+                if val_str in ['', '-', 'nan', 'None']:
+                    return 3  # Default
+                # If it's a range like "3-4", take the first number
+                if '-' in val_str:
+                    try:
+                        return int(val_str.split('-')[0])
+                    except ValueError:
+                        return 3
+                try:
+                    return int(float(val_str))
+                except (ValueError, TypeError):
+                    return 3
+            
+            base_sets = parse_sets_for_count(row.get('Sets'))
+            
+            # Also consider how many sets already have data
+            stored_inputs = st.session_state.exercise_inputs[exercise_key]
+            sets_with_data = len([k for k, v in stored_inputs['sets'].items() if v > 0])
+            base_sets = max(base_sets, sets_with_data)
+            
             extra = st.session_state.extra_sets.get(exercise_key, 0)
             total_sets = base_sets + extra
             
             # Set Input Rows - SIMPLIFIED (only Reps)
             st.markdown("**Log Your Sets:**")
-            
-            stored_inputs = st.session_state.exercise_inputs[exercise_key]
             
             for set_num in range(1, total_sets + 1):
                 set_key = f"set_{set_num}"
