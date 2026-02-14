@@ -4,6 +4,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import plotly.express as px
 import plotly.graph_objects as go
+from datetime import datetime
 
 # --- Configuration ---
 st.set_page_config(
@@ -151,9 +152,15 @@ def load_data():
     records = sheet.get_all_records()
     df = pd.DataFrame(records)
     
-    # Convert numeric columns that may be strings
-    # Convert numeric columns
-    numeric_cols = ['Sets', 'Reps', 'RIR', 'Set1', 'Set2', 'Set3', 'Set4', 'Set5', COL_AVG_RIR]
+    # Keep Sets, Reps, RIR as strings (they may contain "8-10", "2-3" etc)
+    # Do NOT convert these to numeric
+    text_cols = ['Sets', 'Reps', 'RIR', COL_REST]
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).replace('', '-').replace('nan', '-')
+    
+    # Convert only the actual numeric columns
+    numeric_cols = ['Set1', 'Set2', 'Set3', 'Set4', 'Set5', COL_AVG_RIR]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -166,8 +173,10 @@ def load_data():
     if 'Day' in df.columns:
         df['Day'] = df['Day'].astype(str).str.strip()
     
-    # Handle empty strings as NaN
-    df = df.replace('', pd.NA)
+    # Handle empty strings as NaN for non-text columns only
+    for col in df.columns:
+        if col not in text_cols:
+            df[col] = df[col].replace('', pd.NA)
     
     return df
 
@@ -206,7 +215,7 @@ def parse_done(val):
     return False
 
 def save_data(updates: list):
-    """Save updates back to Google Sheets."""
+    """Save updates back to Google Sheets with timestamp."""
     client = get_gspread_client()
     sheet = client.open_by_key(SHEET_ID).sheet1
     
@@ -216,6 +225,9 @@ def save_data(updates: list):
     
     # Create column name to index mapping (1-based for gspread)
     col_map = {name: idx + 1 for idx, name in enumerate(headers)}
+    
+    # Get current timestamp
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     for update in updates:
         # Find the matching row
@@ -265,6 +277,14 @@ def save_data(updates: list):
                         'row': row_idx,
                         'col': col_map[COL_DONE],
                         'value': 'TRUE' if update['done'] else 'FALSE'
+                    })
+                
+                # Update LastSaved timestamp (if column exists)
+                if 'LastSaved' in col_map:
+                    cells_to_update.append({
+                        'row': row_idx,
+                        'col': col_map['LastSaved'],
+                        'value': timestamp
                     })
                 
                 # Batch update cells for this row
@@ -390,29 +410,48 @@ try:
             # Exercise Name (prominent)
             exercise_name = row['Exercise'] if pd.notna(row['Exercise']) else "Exercise"
             st.subheader(exercise_name)
+
             
             # Description (smaller text)
             if pd.notna(row['Description']):
                 st.caption(row['Description'])
             
+            # Helper function to safely display values
+            def safe_display(val, default="-"):
+                """Return display-safe value, replacing NaN/empty with default."""
+                if val is None:
+                    return default
+                try:
+                    if pd.isna(val):
+                        return default
+                except (TypeError, ValueError):
+                    pass
+                if str(val).strip() in ['', 'nan', 'None', '-']:
+                    return default
+                return str(val)
+            
             # --- Target RIR and Rest Info Box (Red/Orange) ---
-            target_rir = row['RIR'] if pd.notna(row.get('RIR')) else "-"
-            rest_val = row[COL_REST] if pd.notna(row.get(COL_REST)) else "-"
+            target_rir = safe_display(row.get('RIR'))
+            rest_val = safe_display(row.get(COL_REST))
             st.markdown(f'''
                 <div class="target-box">
                     <span class="target-text">🎯 Target RIR: {target_rir}  |  ⏱ Rest: {rest_val}</span>
                 </div>
             ''', unsafe_allow_html=True)
             
+            
             # Target Info Box (Sets/Reps)
-            st.markdown('<div class="info-box">', unsafe_allow_html=True)
+            target_sets = str(row['Sets']) if pd.notna(row['Sets']) and str(row['Sets']).strip() not in ['', 'nan', 'None', '0'] else '-'
+            target_reps = str(row['Reps']) if pd.notna(row['Reps']) and str(row['Reps']).strip() not in ['', 'nan', 'None', '0'] else '-'
+
+            
+            # Target Info Box (Sets/Reps) - using native Streamlit
             info_cols = st.columns(2)
             with info_cols[0]:
-                st.markdown(f'<span class="info-label">Target Sets</span><br><span class="info-value">{row["Sets"]}</span>', unsafe_allow_html=True)
+                st.metric(label="🎯 Target Sets", value=target_sets)
             with info_cols[1]:
-                st.markdown(f'<span class="info-label">Target Reps</span><br><span class="info-value">{row["Reps"]}</span>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-            
+                st.metric(label="🔁 Target Reps", value=target_reps)
+
             # Escalation and Notes
             if pd.notna(row.get('Escalation')) and str(row['Escalation']).strip():
                 st.info(f"📈 **Escalation:** {row['Escalation']}")

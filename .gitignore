@@ -10,3 +10,5 @@ __pycache__/
 My_Workout_Tracker_local.py
 My_Workout_Tracker_local - Copy.py
 *.pyproj.user
+google_credentials1.json
+My_Workout_Tracker_test.py
