@@ -4,7 +4,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, date
+import calendar
 
 # --- Configuration ---
 st.set_page_config(
@@ -93,6 +94,52 @@ st.markdown("""
         color: #a0a0a0;
         font-size: 1.5rem;
     }
+    .calendar-grid {
+        display: grid;
+        grid-template-columns: repeat(7, 1fr);
+        gap: 4px;
+        margin: 10px 0;
+    }
+    .calendar-header {
+        text-align: center;
+        font-weight: bold;
+        color: #a0a0a0;
+        padding: 8px 4px;
+        font-size: 0.8rem;
+    }
+    .calendar-day {
+        text-align: center;
+        padding: 8px 4px;
+        border-radius: 8px;
+        background-color: #262730;
+        min-height: 50px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+    }
+    .calendar-day-empty {
+        background-color: transparent;
+    }
+    .calendar-day-number {
+        font-size: 0.9rem;
+        color: #ffffff;
+    }
+    .calendar-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-top: 4px;
+    }
+    .calendar-dot-green { background-color: #00cc66; }
+    .calendar-dot-red { background-color: #ff4444; }
+    .calendar-day-selected {
+        border: 2px solid #4da6ff;
+        background-color: #1e3a5f;
+    }
+    .calendar-day-today {
+        border: 1px solid #ffaa00;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -111,20 +158,16 @@ SCOPES = [
 ]
 
 def get_gspread_client():
-    """Create and return a gspread client. 
-    Works both on Streamlit Cloud (using secrets) and locally (using JSON file).
-    """
+    """Create and return a gspread client."""
     import os
     
     try:
-        # First try Streamlit Cloud secrets
         creds_dict = st.secrets["gcp_service_account"]
         credentials = Credentials.from_service_account_info(
             dict(creds_dict), 
             scopes=SCOPES
         )
     except (KeyError, FileNotFoundError):
-        # Fallback to local credentials file
         os.environ['SSL_CERT_FILE'] = r'C:\Users\CP362988\source\repos\My Workout Tracket\zscaler.pem.cer'
         os.environ['REQUESTS_CA_BUNDLE'] = r'C:\Users\CP362988\source\repos\My Workout Tracket\zscaler.pem.cer'
         
@@ -136,7 +179,7 @@ def get_gspread_client():
     return gspread.authorize(credentials)
 
 def sort_mixed_column(values):
-    """Sort a column with mixed int/str types by converting all to strings."""
+    """Sort a column with mixed int/str types."""
     unique_vals = list(values.dropna().unique())
     try:
         return sorted(unique_vals, key=lambda x: (isinstance(x, str), int(x) if not isinstance(x, str) else float('inf'), str(x)))
@@ -151,27 +194,22 @@ def load_data():
     records = sheet.get_all_records()
     df = pd.DataFrame(records)
     
-    # Keep Sets, Reps, RIR as strings (they may contain "8-10", "2-3" etc)
     text_cols = ['Sets', 'Reps', 'RIR', COL_REST]
     for col in text_cols:
         if col in df.columns:
             df[col] = df[col].astype(str).replace('', '-').replace('nan', '-')
     
-    # Convert only the actual numeric columns
     numeric_cols = ['Set1', 'Set2', 'Set3', 'Set4', 'Set5', COL_AVG_RIR]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # Week should be integer not float
     if 'Week' in df.columns:
         df['Week'] = pd.to_numeric(df['Week'], errors='coerce').fillna(0).astype(int)
 
-    # Day should stay as text string
     if 'Day' in df.columns:
         df['Day'] = df['Day'].astype(str).str.strip()
     
-    # Handle empty strings as NaN for non-text columns only
     for col in df.columns:
         if col not in text_cols:
             df[col] = df[col].replace('', pd.NA)
@@ -183,7 +221,7 @@ def get_exercise_key(week, day, section, exercise):
     return f"{week}_{day}_{section}_{exercise}"
 
 def parse_set_value(val):
-    """Parse a set value to integer, handling various formats."""
+    """Parse a set value to integer."""
     if pd.isna(val):
         return 0
     try:
@@ -213,7 +251,7 @@ def calculate_session_stats(row):
     return total_reps, best_single_set
 
 def parse_done(val):
-    """Parse Done column value to boolean, handling various formats."""
+    """Parse Done column value to boolean."""
     if pd.isna(val):
         return False
     if isinstance(val, bool):
@@ -224,8 +262,25 @@ def parse_done(val):
         return val.strip().upper() in ['TRUE', '1', 'YES', 'Y']
     return False
 
+def parse_last_saved_date(val):
+    """Parse LastSaved column to date object."""
+    if pd.isna(val) or val is None:
+        return None
+    try:
+        val_str = str(val).strip()
+        if val_str in ['', 'nan', 'None']:
+            return None
+        # Parse "YYYY-MM-DD HH:MM:SS" format
+        dt = datetime.strptime(val_str[:10], "%Y-%m-%d")
+        return dt.date()
+    except (ValueError, TypeError):
+        return None
+
 def save_data(updates: list):
-    """Save updates back to Google Sheets with timestamp."""
+    """Save updates back to Google Sheets with timestamp for ALL exercises that day."""
+    if not updates:
+        return
+    
     client = get_gspread_client()
     sheet = client.open_by_key(SHEET_ID).sheet1
     
@@ -234,6 +289,14 @@ def save_data(updates: list):
     col_map = {name: idx + 1 for idx, name in enumerate(headers)}
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
+    # Get Week and Day from first update for the second pass
+    target_week = str(updates[0]['Week']).strip()
+    target_day = str(updates[0]['Day']).strip()
+    
+    # Track which rows we've already updated
+    updated_rows = set()
+    
+    # First pass: update exercises with data
     for update in updates:
         for row_idx, row in enumerate(all_data[1:], start=2):
             row_dict = dict(zip(headers, row))
@@ -268,7 +331,21 @@ def save_data(updates: list):
                 for cell in cells_to_update:
                     sheet.update_cell(cell['row'], cell['col'], cell['value'])
                 
+                updated_rows.add(row_idx)
                 break
+    
+    # Second pass: update LastSaved for ALL remaining rows on the same Week/Day
+    if 'LastSaved' in col_map:
+        for row_idx, row in enumerate(all_data[1:], start=2):
+            if row_idx in updated_rows:
+                continue  # Already updated
+            
+            row_dict = dict(zip(headers, row))
+            week_match = str(row_dict.get('Week', '')).strip() == target_week
+            day_match = str(row_dict.get('Day', '')).strip() == target_day
+            
+            if week_match and day_match:
+                sheet.update_cell(row_idx, col_map['LastSaved'], timestamp)
 
 def find_next_workout(df):
     """Find the next workout to do based on completed data."""
@@ -312,13 +389,38 @@ def find_next_workout(df):
         return all_workouts[0]
 
 
+def get_calendar_data(df):
+    """Extract calendar data from LastSaved column."""
+    calendar_data = {}
+    
+    if 'LastSaved' not in df.columns:
+        return calendar_data
+    
+    for _, row in df.iterrows():
+        saved_date = parse_last_saved_date(row.get('LastSaved'))
+        if saved_date is None:
+            continue
+        
+        date_str = saved_date.isoformat()
+        is_done = parse_done(row.get(COL_DONE))
+        
+        if date_str not in calendar_data:
+            calendar_data[date_str] = {'total': 0, 'done': 0}
+        
+        calendar_data[date_str]['total'] += 1
+        if is_done:
+            calendar_data[date_str]['done'] += 1
+    
+    return calendar_data
+
+
 # --- Main App ---
 st.title("💪 Workout Tracker 2026")
 
 # --- Mode Toggle ---
 app_mode = st.radio(
     "Select Mode",
-    options=["🏋️ Tracker", "📊 Progress", "🏆 Records"],
+    options=["🏋️ Tracker", "📅 Calendar", "🏆 Records"],
     horizontal=True,
     label_visibility="collapsed"
 )
@@ -342,7 +444,6 @@ try:
         if 'last_week_day' not in st.session_state:
             st.session_state.last_week_day = None
         
-        # --- Week and Day Selection with Smart Defaults ---
         default_week, default_day = find_next_workout(df)
         
         col1, col2 = st.columns(2)
@@ -413,13 +514,11 @@ try:
             
             st.divider()
             
-            # --- Current Exercise ---
             current_exercise = exercises_list[current_idx]
             section = current_exercise['section']
             row = current_exercise['row']
             exercise_key = get_exercise_key(selected_week, selected_day, section, row['Exercise'])
             
-            # Pre-populate with existing values from Google Sheets
             if exercise_key not in st.session_state.exercise_inputs:
                 existing_sets = {}
                 for i in range(1, 6):
@@ -602,20 +701,172 @@ try:
                     st.error("❌ Something went wrong while saving. Please try again.")
                     st.caption(f"Error: {str(e)}")
     
-    elif app_mode == "📊 Progress":
+    elif app_mode == "📅 Calendar":
         # ========================================
-        # PROGRESS DASHBOARD VIEW
+        # CALENDAR VIEW
         # ========================================
         
-        st.header("📊 Progress Dashboard")
+        st.header("📅 Workout Calendar")
         
+        # Initialize session state for calendar
+        if 'calendar_year' not in st.session_state:
+            st.session_state.calendar_year = date.today().year
+        if 'calendar_month' not in st.session_state:
+            st.session_state.calendar_month = date.today().month
+        if 'selected_calendar_date' not in st.session_state:
+            st.session_state.selected_calendar_date = None
+        
+        # Get calendar data from LastSaved column
+        calendar_data = get_calendar_data(df)
+        
+        # --- PART A: CALENDAR GRID ---
+        st.subheader("📆 Monthly View")
+        
+        # Month navigation
+        nav_col1, nav_col2, nav_col3 = st.columns([1, 3, 1])
+        with nav_col1:
+            if st.button("◀", key="prev_month", use_container_width=True):
+                if st.session_state.calendar_month == 1:
+                    st.session_state.calendar_month = 12
+                    st.session_state.calendar_year -= 1
+                else:
+                    st.session_state.calendar_month -= 1
+                st.rerun()
+        with nav_col2:
+            month_name = calendar.month_name[st.session_state.calendar_month]
+            st.markdown(f"<h3 style='text-align: center;'>{month_name} {st.session_state.calendar_year}</h3>", unsafe_allow_html=True)
+        with nav_col3:
+            if st.button("▶", key="next_month", use_container_width=True):
+                if st.session_state.calendar_month == 12:
+                    st.session_state.calendar_month = 1
+                    st.session_state.calendar_year += 1
+                else:
+                    st.session_state.calendar_month += 1
+                st.rerun()
+        
+        # Day headers
+        day_headers = st.columns(7)
+        day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        for i, header in enumerate(day_headers):
+            with header:
+                st.markdown(f"<div style='text-align:center; color:#a0a0a0; font-weight:bold;'>{day_names[i]}</div>", unsafe_allow_html=True)
+        
+        # Get calendar for current month
+        cal = calendar.Calendar(firstweekday=0)
+        month_days = cal.monthdayscalendar(st.session_state.calendar_year, st.session_state.calendar_month)
+        today = date.today()
+        
+        # Render calendar grid
+        for week in month_days:
+            cols = st.columns(7)
+            for i, day in enumerate(week):
+                with cols[i]:
+                    if day == 0:
+                        st.markdown("<div style='height:50px;'></div>", unsafe_allow_html=True)
+                    else:
+                        current_date = date(st.session_state.calendar_year, st.session_state.calendar_month, day)
+                        date_str = current_date.isoformat()
+                        
+                        # Determine status indicator
+                        status_indicator = ""
+                        if date_str in calendar_data:
+                            data = calendar_data[date_str]
+                            if data['total'] > 0 and data['done'] == data['total']:
+                                status_indicator = "\n🟢"
+                            elif data['total'] > 0:
+                                status_indicator = "\n🔴"
+                        
+                        # Check if selected
+                        is_selected = st.session_state.selected_calendar_date == date_str
+                        
+                        # Build button label with indicator inside
+                        if is_selected:
+                            button_label = f"*{day}*{status_indicator}"
+                        else:
+                            button_label = f"{day}{status_indicator}"
+                        
+                        if st.button(button_label, key=f"cal_{date_str}", use_container_width=True):
+                            st.session_state.selected_calendar_date = date_str
+                            st.rerun()
+        
+        # Legend
+        st.markdown("""
+        <div style='display:flex; gap:20px; justify-content:center; margin-top:10px; font-size:0.8rem;'>
+            <span>🟢 All exercises completed</span>
+            <span>🔴 Partially completed</span>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.divider()
+        
+        # --- PART B: DAY DETAIL PANEL ---
+        st.subheader("📋 Day Details")
+        
+        if st.session_state.selected_calendar_date:
+            selected_date = st.session_state.selected_calendar_date
+            st.info(f"📅 Showing workouts for: **{selected_date}**")
+            
+            # Filter exercises for selected date
+            if 'LastSaved' in df.columns:
+                day_exercises = df[df['LastSaved'].apply(lambda x: parse_last_saved_date(x) == date.fromisoformat(selected_date) if pd.notna(x) else False)]
+            else:
+                day_exercises = pd.DataFrame()
+            
+            if day_exercises.empty:
+                st.warning("No workout data for this date.")
+            else:
+                # Group by Section
+                for section in day_exercises['Section'].unique():
+                    section_df = day_exercises[day_exercises['Section'] == section]
+                    
+                    with st.expander(f"📌 {section} ({len(section_df)} exercises)", expanded=True):
+                        for _, ex_row in section_df.iterrows():
+                            exercise_name = ex_row.get('Exercise', 'Unknown')
+                            is_done = parse_done(ex_row.get(COL_DONE))
+                            done_icon = "✅" if is_done else "⬜"
+                            
+                            st.markdown(f"**{exercise_name}** {done_icon}")
+                            
+                            # Show sets
+                            sets_display = []
+                            for i in range(1, 6):
+                                set_val = parse_set_value(ex_row.get(f'Set{i}', 0))
+                                if set_val > 0:
+                                    sets_display.append(f"Set {i}: {set_val}")
+                            
+                            if sets_display:
+                                st.caption(" | ".join(sets_display))
+                            
+                            # Show Load/Variation
+                            load_var = ex_row.get(COL_LOAD_VAR)
+                            if pd.notna(load_var) and str(load_var).strip() not in ['', 'nan', 'None']:
+                                st.caption(f"🔧 Load/Variation: {load_var}")
+                            
+                            # Show Avg RIR
+                            avg_rir = ex_row.get(COL_AVG_RIR)
+                            if pd.notna(avg_rir):
+                                try:
+                                    st.caption(f"🎯 Avg RIR: {int(float(avg_rir))}")
+                                except:
+                                    pass
+                            
+                            st.markdown("---")
+        else:
+            st.info("👆 Click on a date above to see workout details.")
+        
+        st.divider()
+        
+        # --- PART C: PROGRESS CHARTS ---
+        st.subheader("📊 Progress Overview")
+        
+        # Filters
         filter_col1, filter_col2 = st.columns(2)
         with filter_col1:
             week_options = ["All Weeks"] + [str(w) for w in sort_mixed_column(df['Week'])]
-            selected_week_filter = st.selectbox("📅 Filter by Week", week_options, key="progress_week")
+            selected_week_filter = st.selectbox("📅 Filter by Week", week_options, key="calendar_progress_week")
         with filter_col2:
             day_options = ["All Days"] + [str(d) for d in sort_mixed_column(df['Day'])]
-            selected_day_filter = st.selectbox("📆 Filter by Day", day_options, key="progress_day")
+            selected_day_filter = st.selectbox("📆 Filter by Day", day_options, key="calendar_progress_day")
         
         filtered_df = df.copy()
         if selected_week_filter != "All Weeks":
@@ -626,99 +877,32 @@ try:
         filtered_df['TotalReps'] = filtered_df.apply(calculate_total_reps, axis=1)
         filtered_df['IsDone'] = filtered_df[COL_DONE].apply(parse_done)
         
-        st.divider()
-        
-        # --- 1. COMPLETION SCORECARD ---
-        st.subheader("✅ Completion Status")
-        
+        # Completion Scorecard
         total_exercises = len(filtered_df)
         done_exercises = filtered_df['IsDone'].sum()
         completion_pct = (done_exercises / total_exercises * 100) if total_exercises > 0 else 0
         
-        # Calculate Days Completed
         done_rows = filtered_df[filtered_df['IsDone'] == True]
         days_completed = done_rows.groupby(['Week', 'Day']).ngroups if not done_rows.empty else 0
         total_days = filtered_df.groupby(['Week', 'Day']).ngroups
         
-        # Calculate Weeks Active
         weeks_active = done_rows['Week'].nunique() if not done_rows.empty else 0
         total_weeks = filtered_df['Week'].nunique()
         
-        # Show all three metrics in a row
         metric_col1, metric_col2, metric_col3 = st.columns(3)
         with metric_col1:
-            st.metric(
-                label="Exercises Completed",
-                value=f"{int(done_exercises)} / {total_exercises}",
-                delta=f"{completion_pct:.0f}%"
-            )
+            st.metric(label="Exercises", value=f"{int(done_exercises)}/{total_exercises}", delta=f"{completion_pct:.0f}%")
         with metric_col2:
             days_pct = (days_completed / total_days * 100) if total_days > 0 else 0
-            st.metric(
-                label="Days Completed",
-                value=f"{days_completed} / {total_days}",
-                delta=f"{days_pct:.0f}%"
-            )
+            st.metric(label="Days", value=f"{days_completed}/{total_days}", delta=f"{days_pct:.0f}%")
         with metric_col3:
             weeks_pct = (weeks_active / total_weeks * 100) if total_weeks > 0 else 0
-            st.metric(
-                label="Weeks Active",
-                value=f"{weeks_active} / {total_weeks}",
-                delta=f"{weeks_pct:.0f}%"
-            )
-        
-        # Visual completion bar
-        if completion_pct >= 80:
-            bar_color = "#00cc66"
-        elif completion_pct >= 50:
-            bar_color = "#ffaa00"
-        else:
-            bar_color = "#ff4444"
-        
-        st.markdown(f'''
-            <div style="background-color: #333; border-radius: 10px; padding: 3px; margin-top: 1rem;">
-                <div style="background-color: {bar_color}; width: {completion_pct}%; height: 30px; border-radius: 8px; 
-                     display: flex; align-items: center; justify-content: center; color: white; font-weight: bold;">
-                    {completion_pct:.0f}%
-                </div>
-            </div>
-        ''', unsafe_allow_html=True)
+            st.metric(label="Weeks", value=f"{weeks_active}/{total_weeks}", delta=f"{weeks_pct:.0f}%")
         
         st.divider()
         
-        # --- 2. TOTAL REPS PER EXERCISE - BAR CHART ---
-        st.subheader("📊 Total Reps per Exercise")
-        
-        reps_by_exercise = filtered_df[filtered_df['TotalReps'] > 0].groupby('Exercise')['TotalReps'].sum().reset_index()
-        reps_by_exercise = reps_by_exercise.sort_values('TotalReps', ascending=True)
-        
-        if not reps_by_exercise.empty:
-            fig_bar = px.bar(
-                reps_by_exercise,
-                x='TotalReps',
-                y='Exercise',
-                orientation='h',
-                title='',
-                color='TotalReps',
-                color_continuous_scale='Blues'
-            )
-            fig_bar.update_layout(
-                paper_bgcolor='#ffffff',
-                plot_bgcolor='#f8f9fa',
-                font=dict(color='#333333'),
-                xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Total Reps', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
-                yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='', tickfont=dict(color='#333333')),
-                coloraxis_showscale=False,
-                height=max(400, len(reps_by_exercise) * 35)
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-        else:
-            st.info("No rep data recorded yet.")
-        
-        st.divider()
-        
-        # --- 3. PROGRESS OVER WEEKS - LINE CHART ---
-        st.subheader("📈 Progress Over Weeks")
+        # Progress Over Weeks by SECTION
+        st.subheader("📈 Progress by Section")
         
         df_for_trends = df.copy()
         if selected_day_filter != "All Days":
@@ -726,22 +910,23 @@ try:
         
         df_for_trends['TotalReps'] = df_for_trends.apply(calculate_total_reps, axis=1)
         
-        weekly_progress = df_for_trends[df_for_trends['TotalReps'] > 0].groupby(
-            ['Week', 'Exercise']
+        # Group by Week and SECTION instead of Exercise
+        section_progress = df_for_trends[df_for_trends['TotalReps'] > 0].groupby(
+            ['Week', 'Section']
         )['TotalReps'].sum().reset_index()
         
-        if not weekly_progress.empty:
-            weekly_progress['WeekSort'] = weekly_progress['Week'].apply(
+        if not section_progress.empty:
+            section_progress['WeekSort'] = section_progress['Week'].apply(
                 lambda x: (0, int(x)) if not isinstance(x, str) else (1, 0)
             )
-            weekly_progress = weekly_progress.sort_values('WeekSort')
-            weekly_progress['Week'] = weekly_progress['Week'].astype(str)
+            section_progress = section_progress.sort_values('WeekSort')
+            section_progress['Week'] = section_progress['Week'].astype(str)
             
             fig_line = px.line(
-                weekly_progress,
+                section_progress,
                 x='Week',
                 y='TotalReps',
-                color='Exercise',
+                color='Section',
                 markers=True,
                 title=''
             )
@@ -751,8 +936,8 @@ try:
                 font=dict(color='#333333'),
                 xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Week', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
                 yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Total Reps', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
-                legend=dict(orientation="h", yanchor="bottom", y=-0.5, xanchor="center", x=0.5, font=dict(color='#333333')),
-                height=450
+                legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5, font=dict(color='#333333')),
+                height=400
             )
             st.plotly_chart(fig_line, use_container_width=True)
         else:
@@ -760,7 +945,7 @@ try:
         
         st.divider()
         
-        # --- 4. AVERAGE RIR TREND - LINE CHART ---
+        # RIR Trend
         st.subheader("🎯 Average RIR Trend")
         st.caption("Lower RIR = working harder 💪")
         
@@ -790,7 +975,7 @@ try:
                 font=dict(color='#333333'),
                 xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Week', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
                 yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Average RIR', range=[0, 5], title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
-                height=350
+                height=300
             )
             st.plotly_chart(fig_rir, use_container_width=True)
         else:
@@ -798,8 +983,8 @@ try:
         
         st.divider()
         
-        # --- 5. COMPLETION TABLE ---
-        st.subheader("📋 Exercise Completion Summary")
+        # Completion Table
+        st.subheader("📋 Exercise Summary")
         
         def count_sets_logged(row):
             count = 0
@@ -824,7 +1009,7 @@ try:
             column_config={
                 "Exercise": st.column_config.TextColumn("Exercise", width="large"),
                 "Section": st.column_config.TextColumn("Section", width="medium"),
-                "Times Completed": st.column_config.NumberColumn("✅ Completed", format="%d"),
+                "Times Completed": st.column_config.NumberColumn("✅ Done", format="%d"),
                 "Total Sets Logged": st.column_config.NumberColumn("🔢 Sets", format="%d")
             }
         )
@@ -844,7 +1029,7 @@ try:
         if records_df.empty:
             st.info("🏋️ No workout data recorded yet. Complete some exercises to see your Personal Records!")
         else:
-            # --- SECTION 1: RECENT PRs ---
+            # SECTION 1: RECENT PRs
             st.subheader("🔥 Recent PRs")
             
             max_week = records_df['Week'].max()
@@ -904,7 +1089,7 @@ try:
             
             st.divider()
             
-            # --- SECTION 2: ALL TIME RECORDS TABLE ---
+            # SECTION 2: ALL TIME RECORDS TABLE
             st.subheader("📋 All-Time Records")
             
             all_time_records = []
@@ -942,7 +1127,7 @@ try:
             
             st.divider()
             
-            # --- SECTION 3: PR BAR CHART ---
+            # SECTION 3: PR BAR CHART
             st.subheader("📊 Best Total Reps by Exercise")
             
             pr_chart_data = records_table[['Exercise', '🏆 Best Total Reps']].copy()
@@ -960,7 +1145,7 @@ try:
                 paper_bgcolor='#ffffff',
                 plot_bgcolor='#f8f9fa',
                 font=dict(color='#333333'),
-                xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Best Total Reps (All Sets Combined)', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
+                xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Best Total Reps', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
                 yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='', tickfont=dict(color='#333333')),
                 height=max(400, len(pr_chart_data) * 40)
             )
