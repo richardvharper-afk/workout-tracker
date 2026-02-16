@@ -190,6 +190,61 @@ def save_data(updates: list):
                 str(row_dict.get('Day', '')).strip() == target_day):
                 sheet.update_cell(row_idx, col_map['LastSaved'], timestamp)
 
+def auto_save_exercise(week, day, section, exercise, 
+                       exercise_inputs, extra_sets):
+    """
+    Silently save a single exercise to Google Sheets 
+    without updating Done or LastSaved columns.
+    Used for draft persistence when navigating exercises.
+    """
+    exercise_key = get_exercise_key(week, day, section, exercise)
+
+    if exercise_key not in exercise_inputs:
+        return  # Nothing to save
+
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_key(SHEET_ID).sheet1
+        all_data = sheet.get_all_values()
+        headers = all_data[0]
+        col_map = {name: idx + 1 for idx, name in enumerate(headers)}
+
+        ex_inputs = exercise_inputs[exercise_key]
+
+        for row_idx, row in enumerate(all_data[1:], start=2):
+            row_dict = dict(zip(headers, row))
+            if (str(row_dict.get('Week', '')).strip() == str(week).strip() and
+                str(row_dict.get('Day', '')).strip() == str(day).strip() and
+                str(row_dict.get('Section', '')).strip() == str(section).strip() and
+                str(row_dict.get('Exercise', '')).strip() == str(exercise).strip()):
+
+                # Save Set values
+                set_num = 1
+                for set_key in sorted(ex_inputs['sets'].keys()):
+                    if set_num <= 5:
+                        col_name = f'Set{set_num}'
+                        if col_name in col_map:
+                            val = ex_inputs['sets'][set_key]
+                            sheet.update_cell(row_idx, col_map[col_name], 
+                                            val if val > 0 else '')
+                        set_num += 1
+
+                # Save Load/Variation
+                if COL_LOAD_VAR in col_map and ex_inputs['load_variation']:
+                    sheet.update_cell(row_idx, col_map[COL_LOAD_VAR], 
+                                    ex_inputs['load_variation'])
+
+                # Save Avg RIR
+                if COL_AVG_RIR in col_map and ex_inputs['avg_rir'] > 0:
+                    sheet.update_cell(row_idx, col_map[COL_AVG_RIR], 
+                                    ex_inputs['avg_rir'])
+
+                # Update last auto-save timestamp in session state
+                st.session_state['last_auto_save'] = datetime.now().strftime("%H:%M")
+                break
+    except Exception:
+        pass  # Silent fail - don't interrupt the user
+
 def find_next_workout(df):
     all_weeks = sorted(df['Week'].unique())
     all_workouts = []
@@ -311,10 +366,31 @@ try:
             nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
             with nav_col1:
                 if st.button("◀", key="prev_btn", disabled=(current_idx == 0), use_container_width=True):
+                    # Auto-save current exercise before navigating
+                    current_ex = exercises_list[current_idx]
+                    auto_save_exercise(
+                        selected_week, selected_day,
+                        current_ex['section'],
+                        current_ex['row']['Exercise'],
+                        st.session_state.exercise_inputs,
+                        st.session_state.extra_sets
+                    )
                     st.session_state.current_exercise_idx = current_idx - 1
                     st.rerun()
+            with nav_col2:
+                if 'last_auto_save' in st.session_state:
+                    st.caption(f"✓ auto-saved at {st.session_state['last_auto_save']}")
             with nav_col3:
                 if st.button("▶", key="next_btn", disabled=(current_idx >= total_exercises - 1), use_container_width=True):
+                    # Auto-save current exercise before navigating
+                    current_ex = exercises_list[current_idx]
+                    auto_save_exercise(
+                        selected_week, selected_day,
+                        current_ex['section'],
+                        current_ex['row']['Exercise'],
+                        st.session_state.exercise_inputs,
+                        st.session_state.extra_sets
+                    )
                     st.session_state.current_exercise_idx = current_idx + 1
                     st.rerun()
 
