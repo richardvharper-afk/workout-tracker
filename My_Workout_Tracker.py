@@ -15,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# --- Custom CSS for mobile-friendly dark mode ---
+# --- Custom CSS ---
 st.markdown("""
 <style>
     .stApp { max-width: 100%; }
@@ -144,12 +144,15 @@ def parse_last_saved_date(val):
     except (ValueError, TypeError):
         return None
 
+# ─────────────────────────────────────────────
+# CHANGE DETECTION HELPERS
+# ─────────────────────────────────────────────
+
 def get_exercise_snapshot(exercise_inputs, exercise_key):
     """Return a hashable snapshot of current exercise state for change detection."""
     if exercise_key not in exercise_inputs:
         return None
     inp = exercise_inputs[exercise_key]
-    # Freeze sets as a sorted tuple of (key, value) pairs
     sets_snapshot = tuple(sorted(inp['sets'].items()))
     return (sets_snapshot, inp['load_variation'], inp['avg_rir'])
 
@@ -160,18 +163,59 @@ def has_exercise_changed(exercise_inputs, exercise_key):
     if current is None:
         return False
     original = st.session_state.get(snapshot_key)
-    # If no snapshot exists yet, treat as unchanged (just loaded from Sheets)
     if original is None:
         return False
     return current != original
 
 def record_exercise_snapshot(exercise_inputs, exercise_key):
-    """Record current state as the baseline — call after load or after save."""
+    """Record current state as baseline — call after load or after save."""
     snapshot_key = f"snapshot_{exercise_key}"
     st.session_state[snapshot_key] = get_exercise_snapshot(exercise_inputs, exercise_key)
 
-def save_data(updates: list):
-    """Save all exercises in ONE batch_update call — no individual update_cell calls."""
+def day_has_any_changes(exercises_list, selected_week, selected_day, exercise_inputs):
+    """Return True if ANY exercise on this day has been changed from its baseline."""
+    for ex in exercises_list:
+        ex_key = get_exercise_key(selected_week, selected_day, ex['section'], ex['row']['Exercise'])
+        if has_exercise_changed(exercise_inputs, ex_key):
+            return True
+    return False
+
+def get_day_existing_timestamp(df, week, day):
+    """
+    Read existing LastSaved timestamp from loaded df for this week/day.
+    Returns the timestamp string if found, None if day has never been saved.
+    """
+    if 'LastSaved' not in df.columns:
+        return None
+    day_rows = df[
+        (df['Week'].astype(str) == str(week)) &
+        (df['Day'].astype(str) == str(day))
+    ]
+    for _, row in day_rows.iterrows():
+        val = row.get('LastSaved')
+        if pd.notna(val) and str(val).strip() not in ['', 'nan', 'None']:
+            return str(val).strip()
+    return None
+
+# ─────────────────────────────────────────────
+# SAVE FUNCTIONS
+# ─────────────────────────────────────────────
+
+def save_data(updates: list, existing_timestamp: str = None):
+    """
+    Save all exercises in ONE batch_update call.
+
+    Timestamp logic:
+      - If existing_timestamp is provided → use it (locked, never overwrite)
+      - If existing_timestamp is None → use today's datetime (first save for this day)
+
+    Done logic:
+      - Exercise has any reps > 0 → Done = TRUE
+      - Exercise has no reps → Done = FALSE
+
+    This function is only called when day_has_any_changes() is True,
+    so we never write to days that were only browsed.
+    """
     from gspread.utils import rowcol_to_a1
     if not updates:
         return
@@ -181,7 +225,10 @@ def save_data(updates: list):
     all_data = sheet.get_all_values()
     headers = all_data[0]
     col_map = {name: idx + 1 for idx, name in enumerate(headers)}
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Use existing timestamp if day was previously saved, else stamp with now
+    timestamp = existing_timestamp if existing_timestamp else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     target_week = str(updates[0]['Week']).strip()
     target_day = str(updates[0]['Day']).strip()
     updated_rows = set()
@@ -195,36 +242,47 @@ def save_data(updates: list):
                 str(row_dict.get('Section', '')).strip() == str(update['Section']).strip() and
                 str(row_dict.get('Exercise', '')).strip() == str(update['Exercise']).strip()):
 
+                # Set values
                 for i, v in enumerate(update['sets'], start=1):
                     if i <= 5 and f'Set{i}' in col_map:
                         batch_updates.append({
                             'range': rowcol_to_a1(row_idx, col_map[f'Set{i}']),
                             'values': [[v if v > 0 else '']]
                         })
+
+                # Load/Variation
                 if COL_LOAD_VAR in col_map:
                     batch_updates.append({
                         'range': rowcol_to_a1(row_idx, col_map[COL_LOAD_VAR]),
                         'values': [[update['load_variation']]]
                     })
+
+                # Avg RIR
                 if COL_AVG_RIR in col_map:
                     batch_updates.append({
                         'range': rowcol_to_a1(row_idx, col_map[COL_AVG_RIR]),
                         'values': [[update['avg_rir'] if update['avg_rir'] > 0 else '']]
                     })
+
+                # Done — based purely on whether reps were entered
                 if COL_DONE in col_map:
                     batch_updates.append({
                         'range': rowcol_to_a1(row_idx, col_map[COL_DONE]),
                         'values': [['TRUE' if update['done'] else 'FALSE']]
                     })
+
+                # LastSaved — always write timestamp (existing or new)
                 if 'LastSaved' in col_map:
                     batch_updates.append({
                         'range': rowcol_to_a1(row_idx, col_map['LastSaved']),
                         'values': [[timestamp]]
                     })
+
                 updated_rows.add(row_idx)
                 break
 
-    # Second pass: stamp LastSaved for all remaining rows on same Week/Day
+    # Stamp ALL remaining rows for this day with same timestamp
+    # (so calendar shows the full day, not just exercises with reps)
     if 'LastSaved' in col_map:
         for row_idx, row in enumerate(all_data[1:], start=2):
             if row_idx in updated_rows:
@@ -244,9 +302,9 @@ def save_data(updates: list):
 def auto_save_exercise(week, day, section, exercise,
                        exercise_inputs, extra_sets):
     """
-    Silently save a single exercise in ONE batch_update call.
-    Does NOT update Done or LastSaved — draft only.
-    Only called when change detection confirms data has changed.
+    Silently save a single exercise — draft only.
+    Does NOT write Done or LastSaved.
+    Only called when change detection confirms data changed.
     """
     from gspread.utils import rowcol_to_a1
     exercise_key = get_exercise_key(week, day, section, exercise)
@@ -287,6 +345,7 @@ def auto_save_exercise(week, day, section, exercise,
                         'range': rowcol_to_a1(row_idx, col_map[COL_LOAD_VAR]),
                         'values': [[ex_inputs['load_variation']]]
                     })
+
                 if COL_AVG_RIR in col_map and ex_inputs['avg_rir'] > 0:
                     batch_updates.append({
                         'range': rowcol_to_a1(row_idx, col_map[COL_AVG_RIR]),
@@ -296,8 +355,8 @@ def auto_save_exercise(week, day, section, exercise,
                 if batch_updates:
                     sheet.batch_update(batch_updates)
 
-                # Update snapshot to new saved state so we don't re-save unchanged data
-                record_exercise_snapshot(exercise_inputs, exercise_key)
+                # NOTE: do NOT reset snapshot here — the "dirty" flag must stay set
+                # until the user presses Save All. Snapshot only resets in Save All.
                 st.session_state['last_auto_save'] = datetime.now().strftime("%H:%M")
                 break
 
@@ -322,7 +381,8 @@ def find_next_workout(df):
     sorted_days = sort_mixed_column(pd.Series(done_df[done_df['Week'] == last_done_week]['Day'].unique()))
     last_done_day = sorted_days[-1] if sorted_days else "1"
     try:
-        last_idx = next((i for i, (w, d) in enumerate(all_workouts) if w == last_done_week and str(d) == str(last_done_day)), None)
+        last_idx = next((i for i, (w, d) in enumerate(all_workouts)
+                         if w == last_done_week and str(d) == str(last_done_day)), None)
         if last_idx is not None and last_idx < len(all_workouts) - 1:
             return all_workouts[last_idx + 1]
         return (last_done_week, str(last_done_day))
@@ -347,7 +407,10 @@ def get_calendar_data(df):
     return calendar_data
 
 
-# --- Main App ---
+# ─────────────────────────────────────────────
+# MAIN APP
+# ─────────────────────────────────────────────
+
 st.title("💪 Workout Tracker 2026")
 
 app_mode = st.radio(
@@ -421,21 +484,20 @@ try:
             current_idx = max(0, min(st.session_state.current_exercise_idx, total_exercises - 1))
             st.session_state.current_exercise_idx = current_idx
 
-            st.markdown(f'<div class="progress-indicator">Exercise {current_idx + 1} of {total_exercises}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="progress-indicator">Exercise {current_idx + 1} of {total_exercises}</div>',
+                        unsafe_allow_html=True)
 
             nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
             with nav_col1:
                 if st.button("◀", key="prev_btn", disabled=(current_idx == 0), use_container_width=True):
                     current_ex = exercises_list[current_idx]
-                    ex_key = get_exercise_key(selected_week, selected_day, current_ex['section'], current_ex['row']['Exercise'])
-                    # Only auto-save if data actually changed
+                    ex_key = get_exercise_key(selected_week, selected_day,
+                                              current_ex['section'], current_ex['row']['Exercise'])
                     if has_exercise_changed(st.session_state.exercise_inputs, ex_key):
                         auto_save_exercise(
                             selected_week, selected_day,
-                            current_ex['section'],
-                            current_ex['row']['Exercise'],
-                            st.session_state.exercise_inputs,
-                            st.session_state.extra_sets
+                            current_ex['section'], current_ex['row']['Exercise'],
+                            st.session_state.exercise_inputs, st.session_state.extra_sets
                         )
                     st.session_state.current_exercise_idx = current_idx - 1
                     st.rerun()
@@ -443,17 +505,16 @@ try:
                 if 'last_auto_save' in st.session_state:
                     st.caption(f"✓ auto-saved at {st.session_state['last_auto_save']}")
             with nav_col3:
-                if st.button("▶", key="next_btn", disabled=(current_idx >= total_exercises - 1), use_container_width=True):
+                if st.button("▶", key="next_btn", disabled=(current_idx >= total_exercises - 1),
+                             use_container_width=True):
                     current_ex = exercises_list[current_idx]
-                    ex_key = get_exercise_key(selected_week, selected_day, current_ex['section'], current_ex['row']['Exercise'])
-                    # Only auto-save if data actually changed
+                    ex_key = get_exercise_key(selected_week, selected_day,
+                                              current_ex['section'], current_ex['row']['Exercise'])
                     if has_exercise_changed(st.session_state.exercise_inputs, ex_key):
                         auto_save_exercise(
                             selected_week, selected_day,
-                            current_ex['section'],
-                            current_ex['row']['Exercise'],
-                            st.session_state.exercise_inputs,
-                            st.session_state.extra_sets
+                            current_ex['section'], current_ex['row']['Exercise'],
+                            st.session_state.exercise_inputs, st.session_state.extra_sets
                         )
                     st.session_state.current_exercise_idx = current_idx + 1
                     st.rerun()
@@ -484,9 +545,11 @@ try:
                         except (ValueError, TypeError):
                             existing_avg_rir = 0
                 st.session_state.exercise_inputs[exercise_key] = {
-                    'sets': existing_sets, 'load_variation': existing_load_var, 'avg_rir': existing_avg_rir
+                    'sets': existing_sets,
+                    'load_variation': existing_load_var,
+                    'avg_rir': existing_avg_rir
                 }
-                # Record baseline snapshot when exercise is first loaded
+                # Record baseline snapshot when first loaded
                 record_exercise_snapshot(st.session_state.exercise_inputs, exercise_key)
 
             st.markdown(f"#### 📌 {section}")
@@ -586,28 +649,47 @@ try:
 
             if st.button("💾 SAVE ALL EXERCISES", type="primary", use_container_width=True):
                 try:
-                    all_exercise_updates = []
-                    for ex in exercises_list:
-                        ex_key = get_exercise_key(selected_week, selected_day, ex['section'], ex['row']['Exercise'])
-                        if ex_key in st.session_state.exercise_inputs:
-                            ex_inputs = st.session_state.exercise_inputs[ex_key]
-                            sets_data = [ex_inputs['sets'][k] for k in sorted(ex_inputs['sets'].keys())]
-                            all_exercise_updates.append({
-                                'Week': selected_week, 'Day': selected_day,
-                                'Section': ex['section'], 'Exercise': ex['row']['Exercise'],
-                                'sets': sets_data, 'load_variation': ex_inputs['load_variation'],
-                                'avg_rir': ex_inputs['avg_rir'], 'done': any(r > 0 for r in sets_data)
-                            })
-                    st.toast('Saving...', icon='⏳')
-                    with st.spinner('💾 Saving your workout to Google Sheets...'):
-                        save_data(all_exercise_updates)
-                    # Reset all snapshots after a full save so change detection resets cleanly
-                    for ex in exercises_list:
-                        ex_key = get_exercise_key(selected_week, selected_day, ex['section'], ex['row']['Exercise'])
-                        record_exercise_snapshot(st.session_state.exercise_inputs, ex_key)
-                    st.success("✅ Workout saved successfully!")
-                    st.balloons()
-                    st.cache_data.clear()
+                    # ── GATE: only save if something actually changed ──
+                    if not day_has_any_changes(exercises_list, selected_week, selected_day,
+                                               st.session_state.exercise_inputs):
+                        st.info("💡 No changes detected — nothing to save.")
+                    else:
+                        # ── TIMESTAMP: lock existing date, or use today for new days ──
+                        existing_ts = get_day_existing_timestamp(df, selected_week, selected_day)
+
+                        all_exercise_updates = []
+                        for ex in exercises_list:
+                            ex_key = get_exercise_key(selected_week, selected_day,
+                                                      ex['section'], ex['row']['Exercise'])
+                            if ex_key in st.session_state.exercise_inputs:
+                                ex_inputs = st.session_state.exercise_inputs[ex_key]
+                                sets_data = [ex_inputs['sets'][k]
+                                             for k in sorted(ex_inputs['sets'].keys())]
+                                all_exercise_updates.append({
+                                    'Week': selected_week,
+                                    'Day': selected_day,
+                                    'Section': ex['section'],
+                                    'Exercise': ex['row']['Exercise'],
+                                    'sets': sets_data,
+                                    'load_variation': ex_inputs['load_variation'],
+                                    'avg_rir': ex_inputs['avg_rir'],
+                                    'done': any(r > 0 for r in sets_data)
+                                })
+
+                        st.toast('Saving...', icon='⏳')
+                        with st.spinner('💾 Saving your workout to Google Sheets...'):
+                            save_data(all_exercise_updates, existing_timestamp=existing_ts)
+
+                        # Reset all snapshots so change detection starts fresh
+                        for ex in exercises_list:
+                            ex_key = get_exercise_key(selected_week, selected_day,
+                                                      ex['section'], ex['row']['Exercise'])
+                            record_exercise_snapshot(st.session_state.exercise_inputs, ex_key)
+
+                        st.success("✅ Workout saved successfully!")
+                        st.balloons()
+                        st.cache_data.clear()
+
                 except gspread.exceptions.APIError as e:
                     st.error("❌ Could not connect to Google Sheets.")
                     st.caption(f"Technical details: {str(e)}")
@@ -666,21 +748,22 @@ try:
         df_for_trends['TotalReps'] = df_for_trends.apply(calculate_total_reps, axis=1)
 
         section_progress = df_for_trends[df_for_trends['TotalReps'] > 0].groupby(
-            ['Week', 'Section']
-        )['TotalReps'].sum().reset_index()
+            ['Week', 'Section'])['TotalReps'].sum().reset_index()
 
         if not section_progress.empty:
             section_progress['WeekSort'] = section_progress['Week'].apply(
-                lambda x: (0, int(x)) if not isinstance(x, str) else (1, 0)
-            )
+                lambda x: (0, int(x)) if not isinstance(x, str) else (1, 0))
             section_progress = section_progress.sort_values('WeekSort')
             section_progress['Week'] = section_progress['Week'].astype(str)
             fig_line = px.line(section_progress, x='Week', y='TotalReps', color='Section', markers=True, title='')
             fig_line.update_layout(
                 paper_bgcolor='#ffffff', plot_bgcolor='#f8f9fa', font=dict(color='#333333'),
-                xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Week', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
-                yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Total Reps', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
-                legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5, font=dict(color='#333333')),
+                xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Week',
+                           title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
+                yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Total Reps',
+                           title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
+                legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center",
+                            x=0.5, font=dict(color='#333333')),
                 height=400
             )
             st.plotly_chart(fig_line, use_container_width=True)
@@ -704,15 +787,18 @@ try:
         rir_by_week = df_for_trends[df_for_trends['AvgRIR'].notna()].groupby('Week')['AvgRIR'].mean().reset_index()
 
         if not rir_by_week.empty:
-            rir_by_week['WeekSort'] = rir_by_week['Week'].apply(lambda x: (0, int(x)) if not isinstance(x, str) else (1, 0))
+            rir_by_week['WeekSort'] = rir_by_week['Week'].apply(
+                lambda x: (0, int(x)) if not isinstance(x, str) else (1, 0))
             rir_by_week = rir_by_week.sort_values('WeekSort')
             rir_by_week['Week'] = rir_by_week['Week'].astype(str)
             fig_rir = px.line(rir_by_week, x='Week', y='AvgRIR', markers=True, title='')
             fig_rir.update_traces(line_color='#ff6b35', marker_color='#ff6b35')
             fig_rir.update_layout(
                 paper_bgcolor='#ffffff', plot_bgcolor='#f8f9fa', font=dict(color='#333333'),
-                xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Week', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
-                yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Average RIR', range=[0, 5], title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
+                xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Week',
+                           title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
+                yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Average RIR',
+                           range=[0, 5], title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
                 height=300
             )
             st.plotly_chart(fig_rir, use_container_width=True)
@@ -727,7 +813,8 @@ try:
             return sum(1 for i in range(1, 6) if parse_set_value(row.get(f'Set{i}', 0)) > 0)
 
         filtered_df['SetsLogged'] = filtered_df.apply(count_sets_logged, axis=1)
-        summary_df = filtered_df.groupby(['Exercise', 'Section']).agg({'IsDone': 'sum', 'SetsLogged': 'sum'}).reset_index()
+        summary_df = filtered_df.groupby(['Exercise', 'Section']).agg(
+            {'IsDone': 'sum', 'SetsLogged': 'sum'}).reset_index()
         summary_df.columns = ['Exercise', 'Section', 'Times Completed', 'Total Sets Logged']
         summary_df = summary_df.sort_values('Times Completed', ascending=False)
         st.dataframe(summary_df, use_container_width=True, hide_index=True,
@@ -763,7 +850,8 @@ try:
                 st.rerun()
         with nav_col2:
             month_name = calendar.month_name[st.session_state.calendar_month]
-            st.markdown(f"<h3 style='text-align:center; margin:0;'>{month_name} {st.session_state.calendar_year}</h3>", unsafe_allow_html=True)
+            st.markdown(f"<h3 style='text-align:center; margin:0;'>{month_name} {st.session_state.calendar_year}</h3>",
+                        unsafe_allow_html=True)
         with nav_col3:
             if st.button("▶", key="next_month", use_container_width=True):
                 if st.session_state.calendar_month == 12:
@@ -779,7 +867,9 @@ try:
 
         html_rows = []
         day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-        header_cells = ''.join([f"<th style='padding:8px; color:#a0a0a0; font-weight:bold; text-align:center;'>{d}</th>" for d in day_names])
+        header_cells = ''.join([
+            f"<th style='padding:8px; color:#a0a0a0; font-weight:bold; text-align:center;'>{d}</th>"
+            for d in day_names])
         html_rows.append(f"<tr>{header_cells}</tr>")
 
         for week in month_days:
@@ -808,7 +898,10 @@ try:
                     elif is_today:
                         cell_style += " border:2px solid #ffaa00;"
                     fw = 'bold' if is_selected else 'normal'
-                    row_cells.append(f"<td style='{cell_style}'><span style='color:#ffffff; font-weight:{fw};'>{day}</span>{status_dot}</td>")
+                    row_cells.append(
+                        f"<td style='{cell_style}'>"
+                        f"<span style='color:#ffffff; font-weight:{fw};'>{day}</span>"
+                        f"{status_dot}</td>")
             html_rows.append(f"<tr>{''.join(row_cells)}</tr>")
 
         st.markdown(f"""
@@ -831,7 +924,8 @@ try:
             selected_idx = 0
             if st.session_state.selected_calendar_date in dates_with_data:
                 selected_idx = dates_with_data.index(st.session_state.selected_calendar_date) + 1
-            selected_date_option = st.selectbox("📅 Select workout date to view details:", date_options, index=selected_idx, key="calendar_date_select")
+            selected_date_option = st.selectbox("📅 Select workout date to view details:",
+                                                date_options, index=selected_idx, key="calendar_date_select")
             if selected_date_option != "Select a date...":
                 st.session_state.selected_calendar_date = selected_date_option
         else:
@@ -864,7 +958,8 @@ try:
                             done_icon = "✅" if parse_done(ex_row.get(COL_DONE)) else "⬜"
                             st.markdown(f"**{ex_row.get('Exercise', 'Unknown')}** {done_icon}")
                             sets_display = [f"Set {i}: {parse_set_value(ex_row.get(f'Set{i}', 0))}"
-                                          for i in range(1, 6) if parse_set_value(ex_row.get(f'Set{i}', 0)) > 0]
+                                            for i in range(1, 6)
+                                            if parse_set_value(ex_row.get(f'Set{i}', 0)) > 0]
                             if sets_display:
                                 st.caption(" | ".join(sets_display))
                             lv = ex_row.get(COL_LOAD_VAR)
@@ -901,8 +996,10 @@ try:
             new_prs = []
 
             if not previous_weeks_df.empty:
-                current_bests = current_week_df.groupby('Exercise').agg({'TotalReps': 'max', 'BestSingleSet': 'max'}).reset_index()
-                previous_bests = previous_weeks_df.groupby('Exercise').agg({'TotalReps': 'max', 'BestSingleSet': 'max'}).reset_index()
+                current_bests = current_week_df.groupby('Exercise').agg(
+                    {'TotalReps': 'max', 'BestSingleSet': 'max'}).reset_index()
+                previous_bests = previous_weeks_df.groupby('Exercise').agg(
+                    {'TotalReps': 'max', 'BestSingleSet': 'max'}).reset_index()
                 for _, curr_row in current_bests.iterrows():
                     exercise = curr_row['Exercise']
                     curr_total = curr_row['TotalReps']
@@ -914,12 +1011,17 @@ try:
                         is_total_pr = curr_total > prev_total
                         is_set_pr = curr_best_set > prev_best_set
                         if is_total_pr or is_set_pr:
-                            new_prs.append({'exercise': exercise, 'curr_total': curr_total, 'prev_total': prev_total,
-                                          'curr_best_set': curr_best_set, 'prev_best_set': prev_best_set,
-                                          'is_total_pr': is_total_pr, 'is_set_pr': is_set_pr})
+                            new_prs.append({
+                                'exercise': exercise, 'curr_total': curr_total, 'prev_total': prev_total,
+                                'curr_best_set': curr_best_set, 'prev_best_set': prev_best_set,
+                                'is_total_pr': is_total_pr, 'is_set_pr': is_set_pr
+                            })
                     else:
-                        new_prs.append({'exercise': exercise, 'curr_total': curr_total, 'prev_total': 0,
-                                      'curr_best_set': curr_best_set, 'prev_best_set': 0, 'is_total_pr': True, 'is_set_pr': True})
+                        new_prs.append({
+                            'exercise': exercise, 'curr_total': curr_total, 'prev_total': 0,
+                            'curr_best_set': curr_best_set, 'prev_best_set': 0,
+                            'is_total_pr': True, 'is_set_pr': True
+                        })
 
             if new_prs:
                 for pr in new_prs:
@@ -966,12 +1068,14 @@ try:
 
             pr_chart_data = records_table[['Exercise', '🏆 Best Total Reps']].copy()
             pr_chart_data = pr_chart_data.sort_values('🏆 Best Total Reps', ascending=True)
-            fig_pr = px.bar(pr_chart_data, x='🏆 Best Total Reps', y='Exercise', orientation='h', title='',
-                           color_discrete_sequence=['#00cc66'])
+            fig_pr = px.bar(pr_chart_data, x='🏆 Best Total Reps', y='Exercise',
+                            orientation='h', title='', color_discrete_sequence=['#00cc66'])
             fig_pr.update_layout(
                 paper_bgcolor='#ffffff', plot_bgcolor='#f8f9fa', font=dict(color='#333333'),
-                xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Best Total Reps', title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
-                yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='', tickfont=dict(color='#333333')),
+                xaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='Best Total Reps',
+                           title_font=dict(color='#333333'), tickfont=dict(color='#333333')),
+                yaxis=dict(gridcolor='#e0e0e0', linecolor='#cccccc', title='',
+                           tickfont=dict(color='#333333')),
                 height=max(400, len(pr_chart_data) * 40)
             )
             st.plotly_chart(fig_pr, use_container_width=True)
