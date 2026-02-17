@@ -144,9 +144,38 @@ def parse_last_saved_date(val):
     except (ValueError, TypeError):
         return None
 
+def get_exercise_snapshot(exercise_inputs, exercise_key):
+    """Return a hashable snapshot of current exercise state for change detection."""
+    if exercise_key not in exercise_inputs:
+        return None
+    inp = exercise_inputs[exercise_key]
+    # Freeze sets as a sorted tuple of (key, value) pairs
+    sets_snapshot = tuple(sorted(inp['sets'].items()))
+    return (sets_snapshot, inp['load_variation'], inp['avg_rir'])
+
+def has_exercise_changed(exercise_inputs, exercise_key):
+    """Return True if exercise data has changed since it was last loaded/saved."""
+    snapshot_key = f"snapshot_{exercise_key}"
+    current = get_exercise_snapshot(exercise_inputs, exercise_key)
+    if current is None:
+        return False
+    original = st.session_state.get(snapshot_key)
+    # If no snapshot exists yet, treat as unchanged (just loaded from Sheets)
+    if original is None:
+        return False
+    return current != original
+
+def record_exercise_snapshot(exercise_inputs, exercise_key):
+    """Record current state as the baseline — call after load or after save."""
+    snapshot_key = f"snapshot_{exercise_key}"
+    st.session_state[snapshot_key] = get_exercise_snapshot(exercise_inputs, exercise_key)
+
 def save_data(updates: list):
+    """Save all exercises in ONE batch_update call — no individual update_cell calls."""
+    from gspread.utils import rowcol_to_a1
     if not updates:
         return
+
     client = get_gspread_client()
     sheet = client.open_by_key(SHEET_ID).sheet1
     all_data = sheet.get_all_values()
@@ -156,6 +185,7 @@ def save_data(updates: list):
     target_week = str(updates[0]['Week']).strip()
     target_day = str(updates[0]['Day']).strip()
     updated_rows = set()
+    batch_updates = []
 
     for update in updates:
         for row_idx, row in enumerate(all_data[1:], start=2):
@@ -164,23 +194,37 @@ def save_data(updates: list):
                 str(row_dict.get('Day', '')).strip() == str(update['Day']).strip() and
                 str(row_dict.get('Section', '')).strip() == str(update['Section']).strip() and
                 str(row_dict.get('Exercise', '')).strip() == str(update['Exercise']).strip()):
-                cells = []
+
                 for i, v in enumerate(update['sets'], start=1):
                     if i <= 5 and f'Set{i}' in col_map:
-                        cells.append({'row': row_idx, 'col': col_map[f'Set{i}'], 'value': v if v > 0 else ''})
+                        batch_updates.append({
+                            'range': rowcol_to_a1(row_idx, col_map[f'Set{i}']),
+                            'values': [[v if v > 0 else '']]
+                        })
                 if COL_LOAD_VAR in col_map:
-                    cells.append({'row': row_idx, 'col': col_map[COL_LOAD_VAR], 'value': update['load_variation']})
+                    batch_updates.append({
+                        'range': rowcol_to_a1(row_idx, col_map[COL_LOAD_VAR]),
+                        'values': [[update['load_variation']]]
+                    })
                 if COL_AVG_RIR in col_map:
-                    cells.append({'row': row_idx, 'col': col_map[COL_AVG_RIR], 'value': update['avg_rir'] if update['avg_rir'] > 0 else ''})
+                    batch_updates.append({
+                        'range': rowcol_to_a1(row_idx, col_map[COL_AVG_RIR]),
+                        'values': [[update['avg_rir'] if update['avg_rir'] > 0 else '']]
+                    })
                 if COL_DONE in col_map:
-                    cells.append({'row': row_idx, 'col': col_map[COL_DONE], 'value': 'TRUE' if update['done'] else 'FALSE'})
+                    batch_updates.append({
+                        'range': rowcol_to_a1(row_idx, col_map[COL_DONE]),
+                        'values': [['TRUE' if update['done'] else 'FALSE']]
+                    })
                 if 'LastSaved' in col_map:
-                    cells.append({'row': row_idx, 'col': col_map['LastSaved'], 'value': timestamp})
-                for cell in cells:
-                    sheet.update_cell(cell['row'], cell['col'], cell['value'])
+                    batch_updates.append({
+                        'range': rowcol_to_a1(row_idx, col_map['LastSaved']),
+                        'values': [[timestamp]]
+                    })
                 updated_rows.add(row_idx)
                 break
 
+    # Second pass: stamp LastSaved for all remaining rows on same Week/Day
     if 'LastSaved' in col_map:
         for row_idx, row in enumerate(all_data[1:], start=2):
             if row_idx in updated_rows:
@@ -188,19 +232,27 @@ def save_data(updates: list):
             row_dict = dict(zip(headers, row))
             if (str(row_dict.get('Week', '')).strip() == target_week and
                 str(row_dict.get('Day', '')).strip() == target_day):
-                sheet.update_cell(row_idx, col_map['LastSaved'], timestamp)
+                batch_updates.append({
+                    'range': rowcol_to_a1(row_idx, col_map['LastSaved']),
+                    'values': [[timestamp]]
+                })
 
-def auto_save_exercise(week, day, section, exercise, 
+    if batch_updates:
+        sheet.batch_update(batch_updates)
+
+
+def auto_save_exercise(week, day, section, exercise,
                        exercise_inputs, extra_sets):
     """
-    Silently save a single exercise to Google Sheets 
-    without updating Done or LastSaved columns.
-    Used for draft persistence when navigating exercises.
+    Silently save a single exercise in ONE batch_update call.
+    Does NOT update Done or LastSaved — draft only.
+    Only called when change detection confirms data has changed.
     """
+    from gspread.utils import rowcol_to_a1
     exercise_key = get_exercise_key(week, day, section, exercise)
 
     if exercise_key not in exercise_inputs:
-        return  # Nothing to save
+        return
 
     try:
         client = get_gspread_client()
@@ -208,8 +260,8 @@ def auto_save_exercise(week, day, section, exercise,
         all_data = sheet.get_all_values()
         headers = all_data[0]
         col_map = {name: idx + 1 for idx, name in enumerate(headers)}
-
         ex_inputs = exercise_inputs[exercise_key]
+        batch_updates = []
 
         for row_idx, row in enumerate(all_data[1:], start=2):
             row_dict = dict(zip(headers, row))
@@ -218,32 +270,40 @@ def auto_save_exercise(week, day, section, exercise,
                 str(row_dict.get('Section', '')).strip() == str(section).strip() and
                 str(row_dict.get('Exercise', '')).strip() == str(exercise).strip()):
 
-                # Save Set values
                 set_num = 1
                 for set_key in sorted(ex_inputs['sets'].keys()):
                     if set_num <= 5:
                         col_name = f'Set{set_num}'
                         if col_name in col_map:
                             val = ex_inputs['sets'][set_key]
-                            sheet.update_cell(row_idx, col_map[col_name], 
-                                            val if val > 0 else '')
+                            batch_updates.append({
+                                'range': rowcol_to_a1(row_idx, col_map[col_name]),
+                                'values': [[val if val > 0 else '']]
+                            })
                         set_num += 1
 
-                # Save Load/Variation
                 if COL_LOAD_VAR in col_map and ex_inputs['load_variation']:
-                    sheet.update_cell(row_idx, col_map[COL_LOAD_VAR], 
-                                    ex_inputs['load_variation'])
-
-                # Save Avg RIR
+                    batch_updates.append({
+                        'range': rowcol_to_a1(row_idx, col_map[COL_LOAD_VAR]),
+                        'values': [[ex_inputs['load_variation']]]
+                    })
                 if COL_AVG_RIR in col_map and ex_inputs['avg_rir'] > 0:
-                    sheet.update_cell(row_idx, col_map[COL_AVG_RIR], 
-                                    ex_inputs['avg_rir'])
+                    batch_updates.append({
+                        'range': rowcol_to_a1(row_idx, col_map[COL_AVG_RIR]),
+                        'values': [[ex_inputs['avg_rir']]]
+                    })
 
-                # Update last auto-save timestamp in session state
+                if batch_updates:
+                    sheet.batch_update(batch_updates)
+
+                # Update snapshot to new saved state so we don't re-save unchanged data
+                record_exercise_snapshot(exercise_inputs, exercise_key)
                 st.session_state['last_auto_save'] = datetime.now().strftime("%H:%M")
                 break
+
     except Exception:
-        pass  # Silent fail - don't interrupt the user
+        pass  # Silent fail — never interrupt navigation
+
 
 def find_next_workout(df):
     all_weeks = sorted(df['Week'].unique())
@@ -366,15 +426,17 @@ try:
             nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
             with nav_col1:
                 if st.button("◀", key="prev_btn", disabled=(current_idx == 0), use_container_width=True):
-                    # Auto-save current exercise before navigating
                     current_ex = exercises_list[current_idx]
-                    auto_save_exercise(
-                        selected_week, selected_day,
-                        current_ex['section'],
-                        current_ex['row']['Exercise'],
-                        st.session_state.exercise_inputs,
-                        st.session_state.extra_sets
-                    )
+                    ex_key = get_exercise_key(selected_week, selected_day, current_ex['section'], current_ex['row']['Exercise'])
+                    # Only auto-save if data actually changed
+                    if has_exercise_changed(st.session_state.exercise_inputs, ex_key):
+                        auto_save_exercise(
+                            selected_week, selected_day,
+                            current_ex['section'],
+                            current_ex['row']['Exercise'],
+                            st.session_state.exercise_inputs,
+                            st.session_state.extra_sets
+                        )
                     st.session_state.current_exercise_idx = current_idx - 1
                     st.rerun()
             with nav_col2:
@@ -382,15 +444,17 @@ try:
                     st.caption(f"✓ auto-saved at {st.session_state['last_auto_save']}")
             with nav_col3:
                 if st.button("▶", key="next_btn", disabled=(current_idx >= total_exercises - 1), use_container_width=True):
-                    # Auto-save current exercise before navigating
                     current_ex = exercises_list[current_idx]
-                    auto_save_exercise(
-                        selected_week, selected_day,
-                        current_ex['section'],
-                        current_ex['row']['Exercise'],
-                        st.session_state.exercise_inputs,
-                        st.session_state.extra_sets
-                    )
+                    ex_key = get_exercise_key(selected_week, selected_day, current_ex['section'], current_ex['row']['Exercise'])
+                    # Only auto-save if data actually changed
+                    if has_exercise_changed(st.session_state.exercise_inputs, ex_key):
+                        auto_save_exercise(
+                            selected_week, selected_day,
+                            current_ex['section'],
+                            current_ex['row']['Exercise'],
+                            st.session_state.exercise_inputs,
+                            st.session_state.extra_sets
+                        )
                     st.session_state.current_exercise_idx = current_idx + 1
                     st.rerun()
 
@@ -422,6 +486,8 @@ try:
                 st.session_state.exercise_inputs[exercise_key] = {
                     'sets': existing_sets, 'load_variation': existing_load_var, 'avg_rir': existing_avg_rir
                 }
+                # Record baseline snapshot when exercise is first loaded
+                record_exercise_snapshot(st.session_state.exercise_inputs, exercise_key)
 
             st.markdown(f"#### 📌 {section}")
             st.subheader(row['Exercise'] if pd.notna(row['Exercise']) else "Exercise")
@@ -535,6 +601,10 @@ try:
                     st.toast('Saving...', icon='⏳')
                     with st.spinner('💾 Saving your workout to Google Sheets...'):
                         save_data(all_exercise_updates)
+                    # Reset all snapshots after a full save so change detection resets cleanly
+                    for ex in exercises_list:
+                        ex_key = get_exercise_key(selected_week, selected_day, ex['section'], ex['row']['Exercise'])
+                        record_exercise_snapshot(st.session_state.exercise_inputs, ex_key)
                     st.success("✅ Workout saved successfully!")
                     st.balloons()
                     st.cache_data.clear()
@@ -551,7 +621,6 @@ try:
 
         st.header("📊 Progress Overview")
 
-        # Filters
         filter_col1, filter_col2 = st.columns(2)
         with filter_col1:
             week_options = ["All Weeks"] + [str(w) for w in sort_mixed_column(df['Week'])]
@@ -569,7 +638,6 @@ try:
         filtered_df['TotalReps'] = filtered_df.apply(calculate_total_reps, axis=1)
         filtered_df['IsDone'] = filtered_df[COL_DONE].apply(parse_done)
 
-        # Scorecard
         total_exercises = len(filtered_df)
         done_exercises = filtered_df['IsDone'].sum()
         completion_pct = (done_exercises / total_exercises * 100) if total_exercises > 0 else 0
@@ -591,7 +659,6 @@ try:
 
         st.divider()
 
-        # Progress by Section chart
         st.subheader("📈 Progress by Section")
         df_for_trends = df.copy()
         if selected_day_filter != "All Days":
@@ -622,7 +689,6 @@ try:
 
         st.divider()
 
-        # RIR Trend
         st.subheader("🎯 Average RIR Trend")
         st.caption("Lower RIR = working harder 💪")
 
@@ -655,7 +721,6 @@ try:
 
         st.divider()
 
-        # Exercise Summary Table
         st.subheader("📋 Exercise Summary")
 
         def count_sets_logged(row):
@@ -676,7 +741,6 @@ try:
 
         st.divider()
 
-        # --- CALENDAR (BELOW PROGRESS) ---
         st.subheader("📅 Workout Calendar")
 
         if 'calendar_year' not in st.session_state:
@@ -775,7 +839,6 @@ try:
 
         st.divider()
 
-        # Day Detail Panel
         st.subheader("📋 Day Details")
         if st.session_state.selected_calendar_date:
             selected_date = st.session_state.selected_calendar_date
